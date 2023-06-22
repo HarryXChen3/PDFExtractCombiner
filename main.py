@@ -327,7 +327,7 @@ if __name__ == "__main__":
     output_dir = Path(working_dir, "output")
 
     try:
-        xlsx_pdf_pairs, disjoint_files = gather_xlsx_pdf_pairs()
+        xlsx_pdf_pairs, disjoint_files = gather_xlsx_pdf_pairs(from_dir=working_dir)
     except DuplicateFileNames:
         # wait until enter to close
         input(f"Unexpected duplicate files exist {'recursively' if SEARCH_FILES_RECURSIVELY else 'directly'} under "
