@@ -19,6 +19,8 @@ USE_WIN32API = True
 WIN32_EXCEL_APPLICATION = "Excel.Application"
 EXCEL_PDF_FILE_FORMAT = 57
 
+SEARCH_FILES_RECURSIVELY = True
+
 USE_EXCEL_ENGINE = "openpyxl"
 PDF_EXTENSION = ".pdf"
 EXCEL_EXTENSION = ".xlsx"
@@ -122,7 +124,10 @@ def win_xlsx_to_pdf(
 
         for page_range in page_ranges:
             for i in range(*page_range.indices(n_sheets)):
-                worksheet = workbook.Worksheets(i)
+                # workbook.Worksheets are 1-indexed instead of 0-indexed, so we need to add 1 here to adjust for that
+                # workbook.Worksheets(1) returns 'Sheet1' for a newly created Excel file
+                # workbook.Worksheets(0) always errors
+                worksheet = workbook.Worksheets(i + 1)
                 worksheet.Activate()
 
                 worksheet_file_path = os.path.join(
@@ -241,20 +246,34 @@ def merge_pdf_xlsx(
     })
 
 
-def get_files_with_ext(from_dir: Path = None, ext: str = PDF_EXTENSION) -> list[Path]:
+def get_files_with_ext(from_dir: Path = None, ext: str = PDF_EXTENSION, recursive: bool = False) -> list[Path]:
     """
     Returns all files with the specified extension from the specified directory
 
     :param from_dir: path of directory that files should be queried for under
     :param ext: extension to look for
+    :param recursive: make the search by extension recursive from the directory
     :return: list of paths leading to matched files
     """
-    return list((Path.cwd() if from_dir is None else from_dir).glob(f"*{ext}"))
+    at_dir = Path.cwd() if from_dir is None else from_dir
+    return list(at_dir.rglob(f"*{ext}")) if recursive else list(at_dir.glob(f"*{ext}"))
+
+
+class DuplicateFileNames(RuntimeError):
+    def __init__(self, *args, **kwargs):
+        super(*args, **kwargs)
 
 
 def gather_xlsx_pdf_pairs(from_dir: Path = None) -> tuple[dict[Path, Path], set[str]]:
     root_dir = (Path.cwd() if from_dir is None else from_dir)
-    found_pdfs, found_xlsx = get_files_with_ext(root_dir, PDF_EXTENSION), get_files_with_ext(root_dir, EXCEL_EXTENSION)
+    found_pdfs = get_files_with_ext(root_dir, ext=PDF_EXTENSION, recursive=SEARCH_FILES_RECURSIVELY)
+    found_xlsx = get_files_with_ext(root_dir, ext=EXCEL_EXTENSION, recursive=SEARCH_FILES_RECURSIVELY)
+
+    mapped_pdfs = {path.stem: path for path in found_pdfs}
+    mapped_xlsx = {path.stem: path for path in found_xlsx}
+
+    if len(found_pdfs) != len(mapped_pdfs) or len(found_xlsx) != len(mapped_xlsx):
+        raise DuplicateFileNames()
 
     pdf_names, xlsx_names = set(path.stem for path in found_pdfs), set(path.stem for path in found_xlsx)
 
@@ -263,7 +282,7 @@ def gather_xlsx_pdf_pairs(from_dir: Path = None) -> tuple[dict[Path, Path], set[
 
     file_path_pairs = {}
     for name in names_intersection:
-        file_path_pairs[Path(root_dir, f"{name}{PDF_EXTENSION}")] = Path(root_dir, f"{name}{EXCEL_EXTENSION}")
+        file_path_pairs[mapped_pdfs[name]] = mapped_xlsx[name]
 
     return file_path_pairs, names_disjoint
 
@@ -307,7 +326,13 @@ if __name__ == "__main__":
 
     output_dir = Path(working_dir, "output")
 
-    xlsx_pdf_pairs, disjoint_files = gather_xlsx_pdf_pairs()
+    try:
+        xlsx_pdf_pairs, disjoint_files = gather_xlsx_pdf_pairs()
+    except DuplicateFileNames:
+        # wait until enter to close
+        input(f"Unexpected duplicate files exist {'recursively' if SEARCH_FILES_RECURSIVELY else 'directly'} under "
+              f"{working_dir}. Please remove/rename them to continue. [Press Enter to exit]")
+        sys.exit(0)
 
     print(f"Working Directory: {working_dir}"
           f"\nIntended Output Directory: {output_dir}"
