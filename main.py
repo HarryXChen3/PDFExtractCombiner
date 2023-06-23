@@ -5,7 +5,9 @@ if os.name != 'nt':
     raise RuntimeError("This application can only run on Windows_NT!")
 
 import tempfile
+import enum
 import sys
+from typing import Never
 from pathlib import Path
 
 import pdfkit
@@ -20,6 +22,7 @@ WIN32_EXCEL_APPLICATION = "Excel.Application"
 EXCEL_PDF_FILE_FORMAT = 57
 
 SEARCH_FILES_RECURSIVELY = True
+DISALLOW_ZERO_PAGE_PDF_MERGE = True
 
 USE_EXCEL_ENGINE = "openpyxl"
 PDF_EXTENSION = ".pdf"
@@ -35,6 +38,7 @@ else:
     raise RuntimeError("Cannot find wkhtmltopdf.exe")
 
 USE_ROOT_AS_WORKING_DIR = "use-root-as-working-dir"
+
 
 def pdf_merge(output_path: str | Path, pdfs: dict[(str | Path), list[pypdf.PageRange]]):
     """
@@ -287,15 +291,16 @@ def gather_xlsx_pdf_pairs(from_dir: Path = None) -> tuple[dict[Path, Path], set[
     return file_path_pairs, names_disjoint
 
 
-def query_yes_no(question: str) -> bool:
+def query_yes_no(question: str, default: bool = False) -> bool:
     """
     Dead simple query yes/no utility
 
     :param question: question str to be asked
+    :param default: default value if no response
     :return: True if yes, False if no
     """
-    response = input(question).lower()
-    return True if response in ["yes", "ye", "y"] else False
+    response = input(f"{question} [{'Y' if default else 'y'}/{'n' if default else 'N'}]: ").lower()
+    return (True if response in ["yes", "ye", "y"] else False) if len(response) > 0 else default
 
 
 def dir_empty(dir_path: Path):
@@ -312,6 +317,175 @@ def dir_empty(dir_path: Path):
     return has_next is None
 
 
+def check_output_dir_is_ok(intended_output_dir: Path) -> bool:
+    """
+    Check output directory doesn't exist and is empty, create it if it doesn't exist
+    Ask if directory exists and is NOT empty, return True if ok, False if not ok
+
+    :param intended_output_dir: output directory path, whether it exists or not
+    :return: True if ok, False if not
+    """
+    try:
+        intended_output_dir.mkdir(exist_ok=True)
+    except OSError as os_error:
+        raise RuntimeError(os_error)
+    finally:
+        if not dir_empty(intended_output_dir):
+            not_empty_is_ok = query_yes_no(
+                f"Directory {intended_output_dir} already exists and is NOT empty; Continue?")
+            if not not_empty_is_ok:
+                return False
+
+        return True
+
+
+def exit_if_not_ok(question: str, default: bool = None):
+    """
+    Invoke sys.exit(0) if answer to question is No (False)
+
+    :param question: question to ask
+    :param default: default value of question
+    :return: None
+    """
+    if not query_yes_no(question=question, default=default):
+        sys.exit(0)
+
+
+def check_do_not_merge_zero(n_merging: int) -> Never | None:
+    """
+    Invokes sys.exit(0) if n <= 0
+
+    :param n_merging: merging n files
+    :return: Never | None
+    """
+    if DISALLOW_ZERO_PAGE_PDF_MERGE and n_merging <= 0:
+        input(f"Cannot merge zero ({n_merging}) files together! Press [Enter] to exit...")
+        sys.exit(0)
+
+
+class Mode(enum.Enum):
+    XLSX_PDF_COMBINE = ".xlsx & .pdf combine (monthly STR & RPM; STR binder report)"
+    PDF_FIRST_PAGE_COMBINE = ".pdf combine (1st page; P&L First Pages)"
+
+
+def mode_selector(modes: list[str] = None) -> Mode:
+    computed_modes = modes if modes is not None else [mode.value for mode in Mode]
+    n_modes = len(computed_modes)
+
+    if n_modes <= 0:
+        raise RuntimeError("unexpected 0-length computed_modes; expected len(computed_modes) > 0")
+
+    print(f"Select a {Mode.__name__} (1-{n_modes}):")
+    for i, mode in enumerate(computed_modes):
+        print(f"\t[{i + 1}] {mode}")
+
+    input_mode = input(f"Mode: ")
+    try:
+        mode_index = int(input_mode) - 1
+        if mode_index < 0 or mode_index > (n_modes - 1):
+            raise ValueError(f"selected_mode out of range; expected 1 <= selected_mode <= {n_modes}")
+    except ValueError as value_err:
+        print(f"You must enter a valid integer between 1 and {n_modes}, inclusive"
+              f"\nExtra: {value_err}")
+
+        return mode_selector(computed_modes)
+
+    return Mode(computed_modes[mode_index])
+
+
+def mode_xlsx_pdf_combine(selected_working_dir: Path, intended_output_dir: Path):
+    try:
+        xlsx_pdf_pairs, disjoint_files = gather_xlsx_pdf_pairs(from_dir=selected_working_dir)
+    except DuplicateFileNames:
+        # wait until enter to close
+        input(
+            f"Unexpected duplicate files exist {'recursively' if SEARCH_FILES_RECURSIVELY else 'directly'} under "
+            f"{selected_working_dir}. Please remove/rename them to continue. Press [Enter] to exit...")
+        sys.exit(0)
+
+    n_xlsx_pdf_pairs = len(xlsx_pdf_pairs)
+
+    print(f"Working Directory: {selected_working_dir}"
+          f"\nIntended Output Directory: {intended_output_dir}"
+          f"\nTMP Directory: {found_tmp_dir}"
+          f"\nMatched xlsx & pdf pairs: {n_xlsx_pdf_pairs}"
+          f"\nUnmatched lone files: {len(disjoint_files)}\n{', '.join(disjoint_files)}"
+          f"\n")
+
+    # check that we aren't attempting a 0 pdf merge when DISALLOW_ZERO_PAGE_PDF_MERGE is true
+    check_do_not_merge_zero(n_xlsx_pdf_pairs)
+
+    exit_if_not_ok("Is the above information correct?", default=True)
+
+    if not check_output_dir_is_ok(intended_output_dir=output_dir):
+        sys.exit(0)
+
+    exit_if_not_ok("Start?", default=True)
+
+    output_paths: list[Path] = []
+    common_excel_instance = create_win_excel_instance()
+    for pdf_path, xlsx_path in tqdm(xlsx_pdf_pairs.items()):
+        output_path = Path(intended_output_dir, f"{pdf_path.stem}_Merged{PDF_EXTENSION}")
+        merge_pdf_xlsx(
+            output_path=output_path,
+            pdf=pdf_path,
+            xlsx=xlsx_path,
+            pdf_pages=[pypdf.PageRange(":3")],
+            xlsx_sheets=[pypdf.PageRange("3:5")],
+            use_excel_instance=common_excel_instance
+        )
+
+        output_paths.append(output_path)
+
+    # add option to merge all pdfs together
+    exit_if_not_ok(f"\nMerge all newly combined .pdfs ({n_xlsx_pdf_pairs}) into a single pdf?", default=True)
+
+    combined_pdf_path = intended_output_dir / f"Combined_1-{n_xlsx_pdf_pairs}{PDF_EXTENSION}"
+    sorted_output_pdfs = sorted(output_paths)
+
+    print(f"Attempting merge of {n_xlsx_pdf_pairs} .pdfs...")
+
+    pdf_merge(
+        combined_pdf_path, {path: [] for path in sorted_output_pdfs}
+    )
+
+    # wait until enter to close
+    input(f"Wrote combined pdf to {combined_pdf_path}. Press [Enter] to exit...")
+
+    common_excel_instance.Quit()
+
+
+def mode_pdf_first_page_combine(selected_working_dir: Path, intended_output_dir: Path):
+    found_pdfs = get_files_with_ext(selected_working_dir, ext=PDF_EXTENSION, recursive=SEARCH_FILES_RECURSIVELY)
+    n_found_pdfs = len(found_pdfs)
+
+    print(f"Working Directory: {selected_working_dir}"
+          f"\nIntended Output Directory: {intended_output_dir}"
+          f"\nTMP Directory: {found_tmp_dir}"
+          f"\nMatched pdf files: {n_found_pdfs}"
+          f"\n")
+
+    # check that we aren't attempting a 0 pdf merge when DISALLOW_ZERO_PAGE_PDF_MERGE is true
+    check_do_not_merge_zero(n_found_pdfs)
+
+    exit_if_not_ok("Is the above information correct?", default=True)
+
+    if not check_output_dir_is_ok(intended_output_dir=output_dir):
+        sys.exit(0)
+
+    exit_if_not_ok("Start?", default=True)
+
+    print(f"Attempting merge of {n_found_pdfs} .pdfs...")
+
+    combined_pdf_path = intended_output_dir / f"Combined_1-{n_found_pdfs}{PDF_EXTENSION}"
+    pdf_merge(
+        combined_pdf_path, {path: [pypdf.PageRange(":1")] for path in found_pdfs}
+    )
+
+    # wait until enter to close
+    input(f"Wrote combined pdf to {combined_pdf_path}. Press [Enter] to exit...")
+
+
 if __name__ == "__main__":
     # exclude filename from args here
     cmd_args = sys.argv[1:]
@@ -325,50 +499,11 @@ if __name__ == "__main__":
         raise RuntimeError(f"Unexpected cmd line argument: {cmd_args[0]}")
 
     output_dir = Path(working_dir, "output")
+    selected_mode = mode_selector()
 
-    try:
-        xlsx_pdf_pairs, disjoint_files = gather_xlsx_pdf_pairs(from_dir=working_dir)
-    except DuplicateFileNames:
-        # wait until enter to close
-        input(f"Unexpected duplicate files exist {'recursively' if SEARCH_FILES_RECURSIVELY else 'directly'} under "
-              f"{working_dir}. Please remove/rename them to continue. [Press Enter to exit]")
-        sys.exit(0)
-
-    print(f"Working Directory: {working_dir}"
-          f"\nIntended Output Directory: {output_dir}"
-          f"\nTMP Directory: {found_tmp_dir}"
-          f"\nMatched xlsx & pdf pairs: {len(xlsx_pdf_pairs)}"
-          f"\nUnmatched lone files: {len(disjoint_files)}\n{', '.join(disjoint_files)}"
-          f"\n")
-
-    initially_correct = query_yes_no("Is the above information correct? [y/n]: ")
-    if not initially_correct:
-        sys.exit(0)
-
-    try:
-        output_dir.mkdir(exist_ok=True)
-    except OSError as os_error:
-        raise RuntimeError(os_error)
-    finally:
-        if not dir_empty(output_dir):
-            not_empty_is_ok = query_yes_no(f"Directory {output_dir} already exists and is NOT empty; Continue? [y/n]: ")
-            if not not_empty_is_ok:
-                sys.exit(0)
-
-    can_start = query_yes_no("Start? [y/n]: ")
-    if not can_start:
-        sys.exit(0)
-
-    common_excel_instance = create_win_excel_instance()
-
-    for pdf_path, xlsx_path in tqdm(xlsx_pdf_pairs.items()):
-        merge_pdf_xlsx(
-            output_path=Path(output_dir, f"{pdf_path.stem}_Merged{PDF_EXTENSION}"),
-            pdf=pdf_path,
-            xlsx=xlsx_path,
-            pdf_pages=[pypdf.PageRange(":3")],
-            xlsx_sheets=[pypdf.PageRange("3:5")],
-            use_excel_instance=common_excel_instance
-        )
-
-    common_excel_instance.Quit()
+    if selected_mode == Mode.XLSX_PDF_COMBINE:
+        mode_xlsx_pdf_combine(selected_working_dir=working_dir, intended_output_dir=output_dir)
+    elif selected_mode == Mode.PDF_FIRST_PAGE_COMBINE:
+        mode_pdf_first_page_combine(selected_working_dir=working_dir, intended_output_dir=output_dir)
+    else:
+        raise RuntimeError(f"Selected_mode {selected_mode} invalid!")
